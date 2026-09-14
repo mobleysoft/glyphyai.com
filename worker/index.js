@@ -10,6 +10,12 @@
 // than "/" because "/" on glyphyai.com already belongs to the shared
 // venture-fleet worker's real waitlist page (see worker/README.md) --
 // this only adds routes that didn't exist before.
+//
+// 2026-09-14 (depth audit): the root domain's own marketing copy already
+// promised "an actual downloadable SVG mark", but /studio only rendered
+// the SVG inline with no way to save it -- a real overclaim on the live
+// page. Fixed: /studio now offers a real "Download SVG" link (Blob +
+// object URL, no server change) so the existing claim is literally true.
 function hash32(str) {
   let h = 2166136261;
   for (let i = 0; i < str.length; i++) {
@@ -114,11 +120,18 @@ async function generate() {
       out.innerHTML = '<p class="err">Error: ' + (data.message || res.status) + '</p>';
       return;
     }
+    const blob = new Blob([data.svg], { type: 'image/svg+xml' });
+    const blobUrl = URL.createObjectURL(blob);
+    const filename = 'glyphyai-' + data.brief.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) + '.svg';
     out.innerHTML =
       '<div class="result">' +
         '<div class="svg-box">' + data.svg + '</div>' +
-        '<pre>' + JSON.stringify({ brief: data.brief, seed: data.seed, capability: data.capability }, null, 2) + '</pre>' +
+        '<div>' +
+          '<pre>' + JSON.stringify({ brief: data.brief, seed: data.seed, capability: data.capability }, null, 2) + '</pre>' +
+          '<a id="dl" download="' + filename + '" style="display:inline-block;margin-top:0.5rem;padding:0.5rem 1rem;background:#00bfa5;color:#0b0b0f;font-weight:700;border-radius:6px;text-decoration:none;">Download SVG</a>' +
+        '</div>' +
       '</div>';
+    document.getElementById('dl').href = blobUrl;
   } catch (e) {
     out.innerHTML = '<p class="err">Request failed: ' + e.message + '</p>';
   } finally {
