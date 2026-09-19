@@ -16,6 +16,30 @@
 // the SVG inline with no way to save it -- a real overclaim on the live
 // page. Fixed: /studio now offers a real "Download SVG" link (Blob +
 // object URL, no server change) so the existing claim is literally true.
+//
+// 2026-09-19 (depth audit): the recorded next_step was monetization --
+// spec_v2's "$39 one-time" pricing_hypothesis had no purchase path
+// anywhere, so a visitor who liked a generated mark could only ever get
+// it for free. Wired a real checkout through vendyai.com per the
+// portfolio's "sell through vendyai" standing policy: POST
+// /api/glyphyai/checkout creates a real, live Stripe Checkout Session
+// (ad-hoc price_data, no pre-created Stripe product needed) for a "Full
+// Pack" -- 3 additional deterministic variations of the same brief plus
+// a commercial usage license -- distinct from the single free preview
+// mark /studio already gives away. Entitlement after payment is checked
+// live against vendyai's own GET /api/checkout/sessions/{id} (real,
+// already-persisted Stripe status) rather than duplicating that state
+// here, so no new D1/storage was needed in this worker. This venture
+// (venture_id "glyphyai") registered with vendyai via a real POST
+// /api/ventures/register call using a freshly generated HMAC secret
+// (stored only as this Worker's own encrypted secret binding,
+// VENDYAI_WEBHOOK_SECRET -- never committed to source). The registered
+// webhook target (/api/glyphyai/vendyai-webhook below) verifies vendyai's
+// real HMAC-SHA256/base64url signature scheme (matching
+// hmacSha256Base64Url in vendyai.com/src/worker.js exactly) and just
+// acknowledges receipt -- fulfillment doesn't depend on the webhook
+// firing, since /api/glyphyai/vector-synthesis-pack re-checks the same
+// live session-status endpoint server-side before releasing the pack.
 function hash32(str) {
   let h = 2166136261;
   for (let i = 0; i < str.length; i++) {
@@ -55,6 +79,48 @@ function synthesize(brief) {
   return { svg, seed: h, color, monogram: letters };
 }
 
+// Paid "Full Pack": 3 more deterministic marks for the same brief, seeded
+// distinctly from the free preview so a paying customer gets real
+// additional variety, not the same mark relabeled.
+function synthesizePack(brief) {
+  return ["::v2", "::v3", "::v4"].map((suffix) => synthesize(brief + suffix));
+}
+
+const VENDYAI_API_BASE = "https://vendyai.com";
+const VENTURE_ID = "glyphyai";
+const PACK_PRICE_USD_CENTS = 3900; // matches ventures.json spec_v2 pricing_hypothesis ($39 one-time)
+
+async function hmacSha256Base64Url(message, secret) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  const binary = String.fromCharCode(...new Uint8Array(sig));
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+// Matches vendyai.com/src/worker.js's forwardToVenture() signing scheme exactly:
+// X-Webhook-Signature = base64url(HMAC-SHA256(`${timestamp}.${rawBody}`, secret)).
+async function verifyVendyaiWebhookSignature(rawBody, timestamp, signature, secret) {
+  if (!timestamp || !signature || !secret) return false;
+  const expected = await hmacSha256Base64Url(`${timestamp}.${rawBody}`, secret);
+  return expected === signature;
+}
+
+// Live entitlement check -- asks vendyai's own already-persisted Stripe
+// session status rather than trusting anything the client sends.
+async function isEntitled(sessionId) {
+  if (!sessionId) return false;
+  try {
+    const res = await fetch(`${VENDYAI_API_BASE}/api/checkout/sessions/${encodeURIComponent(sessionId)}`);
+    if (!res.ok) return false;
+    const row = await res.json();
+    return row.venture_id === VENTURE_ID && row.status === "completed";
+  } catch (e) {
+    return false;
+  }
+}
+
 const UI_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -75,6 +141,10 @@ const UI_HTML = `<!DOCTYPE html>
   pre { background:#17171f; padding:1rem; border-radius:6px; max-width:400px; overflow:auto; font-size:0.8rem; }
   .err { color:#ff8080; margin-top:1rem; }
   .capability { color:#888; font-size:0.75rem; max-width:640px; margin-top:1.5rem; }
+  .buy { margin-top:1rem; padding:1rem; background:#17171f; border:1px solid #33333e; border-radius:10px; max-width:640px; }
+  .buy button { background:#00bfa5; color:#0b0b0f; }
+  .pack { margin-top:1rem; display:flex; gap:1rem; flex-wrap:wrap; }
+  .msg { color:#9ecbff; font-size:0.85rem; margin-top:0.5rem; }
 </style>
 </head>
 <body>
@@ -90,6 +160,16 @@ not a canned response, not a generative AI model. Same brief always produces the
 </div>
 
 <div id="out"></div>
+
+<div class="buy">
+  <strong>Full Pack &mdash; $39 one-time</strong>
+  <p class="note">3 additional variations of this same brief, plus a commercial usage license.
+  Real checkout via <a href="https://vendyai.com" style="color:#9ecbff">vendyai.com</a> (live Stripe Checkout,
+  not a mockup) &mdash; you'll be redirected to a real payment page.</p>
+  <button id="buy">Buy Full Pack</button>
+  <div id="buyMsg"></div>
+</div>
+<div id="packOut" class="pack"></div>
 
 <p class="capability">Honest scope note: this is deterministic procedural generation seeded by your
 text (a hash function choosing among a fixed palette/shape/monogram set), not a machine-learned
@@ -141,7 +221,78 @@ async function generate() {
 }
 document.getElementById('go').addEventListener('click', generate);
 document.getElementById('brief').addEventListener('keydown', (e) => { if (e.key === 'Enter') generate(); });
+
+async function buyPack() {
+  const briefEl = document.getElementById('brief');
+  const buyBtn = document.getElementById('buy');
+  const buyMsg = document.getElementById('buyMsg');
+  const brief = briefEl.value.trim();
+  if (!brief) {
+    buyMsg.innerHTML = '<p class="err">Enter a brief first.</p>';
+    return;
+  }
+  buyBtn.disabled = true;
+  buyBtn.textContent = 'Redirecting to checkout...';
+  try {
+    const res = await fetch('/api/glyphyai/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ brief })
+    });
+    const data = await res.json();
+    if (!res.ok || data.status !== 'success') {
+      buyMsg.innerHTML = '<p class="err">Error: ' + (data.message || res.status) + '</p>';
+      buyBtn.disabled = false;
+      buyBtn.textContent = 'Buy Full Pack';
+      return;
+    }
+    window.location.href = data.checkout_url;
+  } catch (e) {
+    buyMsg.innerHTML = '<p class="err">Request failed: ' + e.message + '</p>';
+    buyBtn.disabled = false;
+    buyBtn.textContent = 'Buy Full Pack';
+  }
+}
+document.getElementById('buy').addEventListener('click', buyPack);
+
+async function checkPurchase() {
+  const params = new URLSearchParams(window.location.search);
+  const sessionId = params.get('purchased');
+  const brief = params.get('brief');
+  if (!sessionId) return;
+  const buyMsg = document.getElementById('buyMsg');
+  const packOut = document.getElementById('packOut');
+  buyMsg.innerHTML = '<p class="msg">Checking your purchase...</p>';
+  if (brief) document.getElementById('brief').value = brief;
+  try {
+    const entRes = await fetch('/api/glyphyai/entitlement?session_id=' + encodeURIComponent(sessionId));
+    const ent = await entRes.json();
+    if (!ent.entitled) {
+      buyMsg.innerHTML = '<p class="msg">No completed payment found yet for this session. If you just paid, this can take a few seconds -- refresh to retry.</p>';
+      return;
+    }
+    buyMsg.innerHTML = '<p class="msg">Payment confirmed. Loading your Full Pack...</p>';
+    const packRes = await fetch('/api/glyphyai/vector-synthesis-pack', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ brief: brief || document.getElementById('brief').value.trim(), session_id: sessionId })
+    });
+    const pack = await packRes.json();
+    if (!packRes.ok || pack.status !== 'success') {
+      buyMsg.innerHTML = '<p class="err">Error loading pack: ' + (pack.message || packRes.status) + '</p>';
+      return;
+    }
+    buyMsg.innerHTML = '<p class="msg">Full Pack unlocked -- licensed for commercial use.</p>';
+    packOut.innerHTML = pack.pack.map(function(item, i) {
+      return '<div class="svg-box">' + item.svg + '</div>';
+    }).join('');
+  } catch (e) {
+    buyMsg.innerHTML = '<p class="err">Could not verify purchase: ' + e.message + '</p>';
+  }
+}
+
 generate();
+checkPurchase();
 </script>
 </body>
 </html>
@@ -185,6 +336,105 @@ export default {
         svg: result.svg,
         seed: result.seed
       }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (url.pathname === "/api/glyphyai/checkout") {
+      if (request.method !== "POST") {
+        return new Response(JSON.stringify({ status: "error", message: "Use POST with a JSON body: {\"brief\": \"...\"}" }), {
+          status: 405, headers: { "Content-Type": "application/json", "Allow": "POST" }
+        });
+      }
+      let body;
+      try { body = await request.json(); } catch (e) { body = {}; }
+      const brief = typeof body.brief === "string" ? body.brief.trim() : "";
+      if (!brief) {
+        return new Response(JSON.stringify({ status: "error", message: "Missing required field: brief (non-empty string)" }), {
+          status: 400, headers: { "Content-Type": "application/json" }
+        });
+      }
+      try {
+        const res = await fetch(`${VENDYAI_API_BASE}/api/checkout/sessions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            venture_id: VENTURE_ID,
+            mode: "payment",
+            success_url: `${url.origin}/studio?purchased={CHECKOUT_SESSION_ID}&brief=${encodeURIComponent(brief)}`,
+            cancel_url: `${url.origin}/studio?brief=${encodeURIComponent(brief)}`,
+            line_items: [{
+              price_data: {
+                currency: "usd",
+                unit_amount: PACK_PRICE_USD_CENTS,
+                product_data: {
+                  name: `GlyphyAI Full Pack -- "${brief}"`,
+                  description: "3 additional procedural mark variations for this brief, plus a commercial usage license."
+                }
+              },
+              quantity: 1
+            }],
+            metadata: { brief }
+          })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.session) {
+          return new Response(JSON.stringify({ status: "error", message: data.error?.message || "checkout session creation failed" }), {
+            status: 502, headers: { "Content-Type": "application/json" }
+          });
+        }
+        return new Response(JSON.stringify({ status: "success", checkout_url: data.session.url, session_id: data.session.id }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ status: "error", message: e.message }), {
+          status: 502, headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+    if (url.pathname === "/api/glyphyai/entitlement" && request.method === "GET") {
+      const sessionId = url.searchParams.get("session_id") || "";
+      const entitled = await isEntitled(sessionId);
+      return new Response(JSON.stringify({ status: "success", entitled }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (url.pathname === "/api/glyphyai/vector-synthesis-pack") {
+      if (request.method !== "POST") {
+        return new Response(JSON.stringify({ status: "error", message: "Use POST with a JSON body: {\"brief\": \"...\", \"session_id\": \"...\"}" }), {
+          status: 405, headers: { "Content-Type": "application/json", "Allow": "POST" }
+        });
+      }
+      let body;
+      try { body = await request.json(); } catch (e) { body = {}; }
+      const brief = typeof body.brief === "string" ? body.brief.trim() : "";
+      const sessionId = typeof body.session_id === "string" ? body.session_id.trim() : "";
+      if (!brief) {
+        return new Response(JSON.stringify({ status: "error", message: "Missing required field: brief (non-empty string)" }), {
+          status: 400, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const entitled = await isEntitled(sessionId);
+      if (!entitled) {
+        return new Response(JSON.stringify({ status: "error", message: "No completed purchase found for this session. See POST /api/glyphyai/checkout." }), {
+          status: 402, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const pack = synthesizePack(brief).map((r) => ({ svg: r.svg, seed: r.seed }));
+      return new Response(JSON.stringify({ status: "success", brief, license: "commercial", pack }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (url.pathname === "/api/glyphyai/vendyai-webhook" && request.method === "POST") {
+      const raw = await request.text();
+      const sig = request.headers.get("X-Webhook-Signature");
+      const ts = request.headers.get("X-Webhook-Timestamp");
+      const ok = await verifyVendyaiWebhookSignature(raw, ts, sig, env.VENDYAI_WEBHOOK_SECRET);
+      if (!ok) {
+        return new Response(JSON.stringify({ status: "error", message: "invalid signature" }), {
+          status: 401, headers: { "Content-Type": "application/json" }
+        });
+      }
+      // Fulfillment doesn't depend on this firing -- entitlement is
+      // re-checked live via /api/glyphyai/entitlement at delivery time --
+      // so this handler only needs to acknowledge a verified event.
+      console.log("[glyphyai] verified vendyai webhook received:", raw.slice(0, 300));
+      return new Response(JSON.stringify({ received: true }), { headers: { "Content-Type": "application/json" } });
     }
     return new Response("glyphyai.com - Procedural SVG/icon generation API. Endpoint: POST /api/glyphyai/vector-synthesis with JSON body {\"brief\": \"...\"}", { status: 404 });
   }
