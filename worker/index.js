@@ -17,6 +17,23 @@
 // page. Fixed: /studio now offers a real "Download SVG" link (Blob +
 // object URL, no server change) so the existing claim is literally true.
 //
+// 2026-09-21 (depth audit): found and fixed a real business-logic gap in
+// the 2026-09-19 checkout work -- entitlement was checked by session_id
+// alone (via vendyai's GET /api/checkout/sessions/{id}, which returns only
+// {venture_id, status, amount_total, currency, created_at}, no metadata/
+// brief). vector-synthesis-pack accepted an arbitrary client-supplied
+// `brief` independent of what was actually purchased, so a single
+// completed $39 session entitled the buyer to unlimited packs for ANY
+// brief, forever -- not just the one they paid for. Since vendyai's API
+// doesn't expose the original brief for the worker to check against, the
+// fix is a signed pack_token (HMAC over `${session_id}:${brief}`, keyed by
+// the same VENDYAI_WEBHOOK_SECRET already bound to this worker) minted
+// only inside the real POST /api/glyphyai/checkout response (which itself
+// requires a fresh, real vendyai session creation call each time) and
+// required again at vector-synthesis-pack time alongside the existing
+// live isEntitled() check. This ties each individual completed payment to
+// exactly the one (session, brief) pair it was actually issued for --
+// no new storage, no new secret, no client trust.
 // 2026-09-19 (depth audit): the recorded next_step was monetization --
 // spec_v2's "$39 one-time" pricing_hypothesis had no purchase path
 // anywhere, so a visitor who liked a generated mark could only ever get
@@ -105,6 +122,20 @@ async function verifyVendyaiWebhookSignature(rawBody, timestamp, signature, secr
   if (!timestamp || !signature || !secret) return false;
   const expected = await hmacSha256Base64Url(`${timestamp}.${rawBody}`, secret);
   return expected === signature;
+}
+
+// Binds a completed payment to the exact brief it was issued for. vendyai's
+// session-status endpoint doesn't expose the original metadata.brief, so
+// this worker mints its own signed proof at checkout time instead of
+// trusting a client-supplied brief at pack-generation time.
+async function packToken(sessionId, brief, secret) {
+  return hmacSha256Base64Url(`pack:${sessionId}:${brief}`, secret);
+}
+
+async function verifyPackToken(sessionId, brief, token, secret) {
+  if (!token || !secret) return false;
+  const expected = await packToken(sessionId, brief, secret);
+  return expected === token;
 }
 
 // Live entitlement check -- asks vendyai's own already-persisted Stripe
@@ -246,6 +277,7 @@ async function buyPack() {
       buyBtn.textContent = 'Buy Full Pack';
       return;
     }
+    try { localStorage.setItem('glyphyai_pt_' + data.session_id, data.pack_token); } catch (e) {}
     window.location.href = data.checkout_url;
   } catch (e) {
     buyMsg.innerHTML = '<p class="err">Request failed: ' + e.message + '</p>';
@@ -272,10 +304,12 @@ async function checkPurchase() {
       return;
     }
     buyMsg.innerHTML = '<p class="msg">Payment confirmed. Loading your Full Pack...</p>';
+    let packToken = '';
+    try { packToken = localStorage.getItem('glyphyai_pt_' + sessionId) || ''; } catch (e) {}
     const packRes = await fetch('/api/glyphyai/vector-synthesis-pack', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ brief: brief || document.getElementById('brief').value.trim(), session_id: sessionId })
+      body: JSON.stringify({ brief: brief || document.getElementById('brief').value.trim(), session_id: sessionId, pack_token: packToken })
     });
     const pack = await packRes.json();
     if (!packRes.ok || pack.status !== 'success') {
@@ -380,7 +414,10 @@ export default {
             status: 502, headers: { "Content-Type": "application/json" }
           });
         }
-        return new Response(JSON.stringify({ status: "success", checkout_url: data.session.url, session_id: data.session.id }), {
+        const token = await packToken(data.session.id, brief, env.VENDYAI_WEBHOOK_SECRET);
+        return new Response(JSON.stringify({
+          status: "success", checkout_url: data.session.url, session_id: data.session.id, pack_token: token
+        }), {
           headers: { "Content-Type": "application/json" }
         });
       } catch (e) {
@@ -404,9 +441,16 @@ export default {
       try { body = await request.json(); } catch (e) { body = {}; }
       const brief = typeof body.brief === "string" ? body.brief.trim() : "";
       const sessionId = typeof body.session_id === "string" ? body.session_id.trim() : "";
+      const submittedToken = typeof body.pack_token === "string" ? body.pack_token.trim() : "";
       if (!brief) {
         return new Response(JSON.stringify({ status: "error", message: "Missing required field: brief (non-empty string)" }), {
           status: 400, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const tokenValid = await verifyPackToken(sessionId, brief, submittedToken, env.VENDYAI_WEBHOOK_SECRET);
+      if (!tokenValid) {
+        return new Response(JSON.stringify({ status: "error", message: "This session's purchase doesn't match the requested brief. Start a new checkout for this brief via POST /api/glyphyai/checkout." }), {
+          status: 403, headers: { "Content-Type": "application/json" }
         });
       }
       const entitled = await isEntitled(sessionId);
