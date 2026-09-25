@@ -66,14 +66,46 @@ function hash32(str) {
   return h >>> 0;
 }
 
-const PALETTE = ["#00BFA5", "#FF4081", "#FF80AB", "#3D5AFE", "#FFC400", "#00E5FF"];
+// 2026-09-25 (depth audit): the 2026-09-24 pass's own honest finding was
+// that a fixed 6-color x 5-shape palette (30 combinations, before the
+// monogram/text) gives a "logo generator" audience too few visually
+// distinct outcomes -- likely to be noticed on a Product Hunt launch.
+// Expanded to 12 colors x 10 shapes x a filled/outline variant (240
+// combinations) so two unrelated briefs are far less likely to land on
+// the same visual mark. Still deterministic, still honestly labeled as
+// procedural (not generative-AI) -- this widens the fixed set, it doesn't
+// change what kind of generation this is.
+const PALETTE = [
+  "#00BFA5", "#FF4081", "#FF80AB", "#3D5AFE", "#FFC400", "#00E5FF",
+  "#7C4DFF", "#FF6D00", "#64DD17", "#D500F9", "#F50057", "#6200EA",
+];
+
+function polygonShape(points) {
+  return (c, filled) => filled
+    ? `<polygon points="${points}" fill="${c}"/>`
+    : `<polygon points="${points}" fill="none" stroke="${c}" stroke-width="3" stroke-linejoin="round"/>`;
+}
+function pathShape(d) {
+  return (c, filled) => filled
+    ? `<path d="${d}" fill="${c}"/>`
+    : `<path d="${d}" fill="none" stroke="${c}" stroke-width="3" stroke-linejoin="round"/>`;
+}
 
 const SHAPES = [
-  (c) => `<circle cx="32" cy="32" r="22" fill="none" stroke="${c}" stroke-width="3"/>`,
-  (c) => `<polygon points="32,8 56,48 8,48" fill="none" stroke="${c}" stroke-width="3" stroke-linejoin="round"/>`,
-  (c) => `<rect x="12" y="12" width="40" height="40" rx="8" fill="none" stroke="${c}" stroke-width="3"/>`,
-  (c) => `<polygon points="32,6 54,20 54,44 32,58 10,44 10,20" fill="none" stroke="${c}" stroke-width="3" stroke-linejoin="round"/>`,
-  (c) => `<path d="M8 44 L26 12 L34 24 L18 52 Z" fill="none" stroke="${c}" stroke-width="3" stroke-linejoin="round"/>`,
+  (c, filled) => filled
+    ? `<circle cx="32" cy="32" r="22" fill="${c}"/>`
+    : `<circle cx="32" cy="32" r="22" fill="none" stroke="${c}" stroke-width="3"/>`,
+  polygonShape("32,8 56,48 8,48"), // triangle
+  (c, filled) => filled
+    ? `<rect x="12" y="12" width="40" height="40" rx="8" fill="${c}"/>`
+    : `<rect x="12" y="12" width="40" height="40" rx="8" fill="none" stroke="${c}" stroke-width="3"/>`,
+  polygonShape("32,6 54,20 54,44 32,58 10,44 10,20"), // hexagon
+  pathShape("M8 44 L26 12 L34 24 L18 52 Z"), // kite
+  polygonShape("32,10 54,32 32,54 10,32"), // diamond
+  polygonShape("32,8 54.8,24.6 46.1,51.4 17.9,51.4 9.2,24.6"), // pentagon
+  polygonShape("24,10 40,10 40,24 54,24 54,40 40,40 40,54 24,54 24,40 10,40 10,24 24,24"), // plus
+  polygonShape("32,8 37.9,23.9 54.8,24.6 41.5,35.1 46.1,51.4 32,42 17.9,51.4 22.5,35.1 9.2,24.6 26.1,23.9"), // 5-point star
+  pathShape("M32 6 C42 20 48 30 48 40 A16 16 0 1 1 16 40 C16 30 22 20 32 6 Z"), // teardrop
 ];
 
 function monogram(brief) {
@@ -86,14 +118,24 @@ function monogram(brief) {
 
 function synthesize(brief) {
   const h = hash32(brief.toLowerCase().trim());
-  const color = PALETTE[h % PALETTE.length];
-  const shape = SHAPES[Math.floor(h / PALETTE.length) % SHAPES.length];
+  const colorIdx = h % PALETTE.length;
+  const color = PALETTE[colorIdx];
+  let rest = Math.floor(h / PALETTE.length);
+  const shapeIdx = rest % SHAPES.length;
+  const shape = SHAPES[shapeIdx];
+  rest = Math.floor(rest / SHAPES.length);
+  const filled = (rest % 2) === 1;
   const letters = monogram(brief);
+  // Dark monogram on a filled/saturated shape, brand-color monogram on an
+  // outline (matches the studio page's dark background) -- either way
+  // stays legible across the whole palette rather than picking one text
+  // color that only works for half the combinations.
+  const textFill = filled ? "#0d0d12" : color;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">` +
-    shape(color) +
-    `<text x="32" y="38" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="16" font-weight="700" fill="${color}">${letters}</text>` +
+    shape(color, filled) +
+    `<text x="32" y="38" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="16" font-weight="700" fill="${textFill}">${letters}</text>` +
     `</svg>`;
-  return { svg, seed: h, color, monogram: letters };
+  return { svg, seed: h, color, colorIdx, shapeIdx, filled, monogram: letters };
 }
 
 // Paid "Full Pack": 3 more deterministic marks for the same brief, seeded
@@ -203,7 +245,7 @@ not a canned response, not a generative AI model. Same brief always produces the
 <div id="packOut" class="pack"></div>
 
 <p class="capability">Honest scope note: this is deterministic procedural generation seeded by your
-text (a hash function choosing among a fixed palette/shape/monogram set), not a machine-learned
+text (a hash function choosing among a fixed palette/shape/fill-treatment/monogram set), not a machine-learned
 image model. It's a real, working first pass at a mark generator, not a claim of AI-designed
 branding.</p>
 
@@ -365,7 +407,7 @@ export default {
       return new Response(JSON.stringify({
         status: "success",
         generated: true,
-        capability: "Procedural SVG/icon generation (deterministic, non-AI -- the brief's text seeds a real shape/color/monogram choice, not a machine-learned model)",
+        capability: "Procedural SVG/icon generation (deterministic, non-AI -- the brief's text seeds a real shape/color/fill-treatment/monogram choice, not a machine-learned model)",
         brief,
         svg: result.svg,
         seed: result.seed
